@@ -12,6 +12,9 @@ import random
 from music.options import (
     CHORD_CHARACTERISTICS,
     COMPLEXITIES,
+    RESOLUTION_PREFERENCES,
+    TENSION_LEVELS,
+    VOICE_LEADING_PREFERENCES,
     KEY_TYPES,
     MINOR_SCALE_TYPES,
     MOODS,
@@ -33,6 +36,15 @@ class RandomizedParameters:
     characteristics: tuple[str, ...]
     chords_per_progression: int
     progression_count: int
+    start_degree: int | None
+    end_degree: int | None
+    tension_preference: str
+    resolution_preference: str
+    voice_leading_preference: str
+    required_degrees: tuple[int, ...] = ()
+    excluded_degrees: tuple[int, ...] = ()
+    max_difficulty: str = "Any"
+    chord_families: tuple[str, ...] = ()
 
 
 def _sample_nonempty(options: list[str], rng: random.Random, maximum: int) -> tuple[str, ...]:
@@ -65,4 +77,13 @@ def randomized_parameters(seed: int | None = None) -> RandomizedParameters:
         characteristics=_sample_nonempty(CHORD_CHARACTERISTICS, rng, 4),
         chords_per_progression=rng.randint(2, 8),
         progression_count=rng.randint(1, 8),
+        start_degree=(None if rng.random() < 0.45 else rng.randint(1, 7)),
+        end_degree=(None if rng.random() < 0.45 else rng.randint(1, 7)),
+        tension_preference=rng.choice(TENSION_LEVELS),
+        resolution_preference=rng.choice(RESOLUTION_PREFERENCES),
+        voice_leading_preference=rng.choice(VOICE_LEADING_PREFERENCES),
+        required_degrees=(),
+        excluded_degrees=(),
+        max_difficulty="Any",
+        chord_families=(),
     )

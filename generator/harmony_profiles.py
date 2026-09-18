@@ -1,13 +1,13 @@
-"""Mood/style harmony profiles and candidate scoring.
+"""Formal mood/style harmony profiles and candidate scoring.
 
-Step 6 adds the musical-character intelligence layer without generating full
-progressions.  Profiles describe harmonic preferences; the future progression
-engine will use these scores when ranking chord candidates and progressions.
+Each product mood and musical character has an explicit, validated harmonic
+profile.  A combined profile carries both chord-vocabulary preferences and
+curated progression-family preferences into the progression generator.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Iterable
 
 from music.models import Chord
@@ -24,6 +24,14 @@ class HarmonyProfile:
     avoided_qualities: frozenset[str]
     tension: float  # 0.0 = relaxed, 1.0 = highly tense
     complexity_bias: float  # -1.0 = simple, +1.0 = complex
+    template_preferences: tuple[tuple[str, float], ...] = ()
+
+    def template_weight(self, family: str) -> float:
+        """Return the profile weight for one curated progression family."""
+        for name, weight in self.template_preferences:
+            if name == family:
+                return weight
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +253,75 @@ STYLE_PROFILES: dict[str, HarmonyProfile] = {
 }
 
 
+# Curated progression-family vocabulary used by the generator. Keeping these
+# preferences on the harmony profiles prevents style/mood logic from being
+# split across separate generation modules.
+TEMPLATE_FAMILIES = frozenset({
+    "jazz",
+    "pop",
+    "funk",
+    "classic",
+    "cinematic",
+    "minor",
+})
+
+_STYLE_TEMPLATE_PREFERENCES: dict[str, dict[str, float]] = {
+    "Neo Soul": {"jazz": 1.6, "pop": 0.4},
+    "Jazz": {"jazz": 2.0, "classic": 0.7},
+    "R&B": {"jazz": 1.5, "pop": 0.7},
+    "Funk": {"funk": 1.8, "classic": 0.4},
+    "Pop": {"pop": 1.8, "classic": 0.7},
+    "Blues": {"funk": 1.7, "classic": 0.8},
+    "Lo-fi": {"jazz": 1.2, "pop": 0.6},
+    "Gospel": {"jazz": 1.6, "classic": 0.8},
+    "Acoustic": {"pop": 1.6, "classic": 0.7},
+    "Rock": {"classic": 1.6, "funk": 0.9},
+    "Cinematic": {"cinematic": 1.8, "classic": 0.7},
+}
+
+_MOOD_TEMPLATE_PREFERENCES: dict[str, dict[str, float]] = {
+    "Happy": {"pop": 1.0, "classic": 0.7},
+    "Sad": {"minor": 1.2, "cinematic": 0.8},
+    "Dreamy": {"jazz": 1.0, "cinematic": 0.9},
+    "Dark": {"minor": 1.5, "cinematic": 1.0},
+    "Romantic": {"jazz": 1.1, "pop": 0.7},
+    "Mysterious": {"cinematic": 1.4, "minor": 1.0},
+    "Tense": {"jazz": 0.9, "cinematic": 1.2},
+    "Peaceful": {"pop": 0.9, "classic": 0.8},
+    "Nostalgic": {"classic": 1.2, "pop": 0.7},
+    "Funky": {"funk": 1.5},
+    "Soulful": {"jazz": 1.3, "classic": 0.5},
+    "Cinematic": {"cinematic": 1.7},
+    "Hopeful": {"pop": 1.2, "classic": 0.7},
+    "Aggressive": {"funk": 1.1, "minor": 0.8},
+    "Melancholic": {"minor": 1.4, "jazz": 0.8},
+}
+
+
+def _attach_template_preferences(
+    profiles: dict[str, HarmonyProfile],
+    preferences: dict[str, dict[str, float]],
+) -> dict[str, HarmonyProfile]:
+    """Return profiles with validated, immutable template preferences."""
+    enriched: dict[str, HarmonyProfile] = {}
+    for name, profile in profiles.items():
+        weights = preferences.get(name, {})
+        unknown = set(weights) - TEMPLATE_FAMILIES
+        if unknown:
+            raise ValueError(
+                f"Unsupported template family in profile {name!r}: {sorted(unknown)}"
+            )
+        enriched[name] = replace(
+            profile,
+            template_preferences=tuple(sorted(weights.items())),
+        )
+    return enriched
+
+
+MOOD_PROFILES = _attach_template_preferences(MOOD_PROFILES, _MOOD_TEMPLATE_PREFERENCES)
+STYLE_PROFILES = _attach_template_preferences(STYLE_PROFILES, _STYLE_TEMPLATE_PREFERENCES)
+
+
 def get_mood_profile(mood: str) -> HarmonyProfile:
     """Return the validated harmony profile for one product mood."""
     try:
@@ -339,6 +416,18 @@ def combine_profiles(
     tension = sum(profile.tension for profile in profiles) / len(profiles)
     complexity_bias = sum(profile.complexity_bias for profile in profiles) / len(profiles)
 
+    template_scores: dict[str, float] = {}
+    for profile in profiles:
+        for family, weight in profile.template_preferences:
+            template_scores[family] = template_scores.get(family, 0.0) + weight
+    template_preferences = tuple(
+        sorted(
+            (family, round(weight, 6))
+            for family, weight in template_scores.items()
+            if weight
+        )
+    )
+
     name_parts = (*mood_values, *style_values)
     return HarmonyProfile(
         " + ".join(name_parts),
@@ -347,6 +436,7 @@ def combine_profiles(
         avoided_qualities,
         tension,
         complexity_bias,
+        template_preferences,
     )
 
 

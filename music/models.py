@@ -78,6 +78,15 @@ class GeneratorParameters:
     characteristics: tuple[str, ...]
     chords_per_progression: int = 4
     progression_count: int = 4
+    start_degree: int | None = None
+    end_degree: int | None = None
+    tension_preference: str = 'Balanced'
+    resolution_preference: str = 'Flexible'
+    voice_leading_preference: str = 'Balanced'
+    required_degrees: tuple[int, ...] = ()
+    excluded_degrees: tuple[int, ...] = ()
+    max_difficulty: str = 'Any'
+    chord_families: tuple[str, ...] = ()
 
     @staticmethod
     def build_key(

@@ -1,24 +1,37 @@
 from __future__ import annotations
 
-import random
-
 import streamlit as st
 import streamlit.components.v1 as components
 
+from generator.harmony_rules import chord_function, degree_choices
 from generator.playback import build_playback_html
 from generator.progression import GeneratedProgressions, Progression, generate_progressions
 from generator.ui_state import randomized_parameters
+from generator.filters import active_filter_labels
+from generator.seeding import MAX_SEED, MIN_SEED, random_seed, seed_for_action
+from generator.result_tools import (
+    explain_functions,
+    refinement_help,
+    refinement_is_available,
+    refinement_label,
+    refine_parameters,
+)
 from music.key_chords import get_chords_in_key
 from music.models import GeneratorParameters
 from music.options import (
     ACCIDENTALS,
     CHORD_CHARACTERISTICS,
     COMPLEXITIES,
+    CHORD_FAMILIES,
+    DIFFICULTY_FILTERS,
     KEY_TYPES,
     MINOR_SCALE_TYPES,
     MOODS,
     MUSICAL_CHARACTERS,
     ROOT_NOTES,
+    RESOLUTION_PREFERENCES,
+    TENSION_LEVELS,
+    VOICE_LEADING_PREFERENCES,
 )
 
 st.set_page_config(
@@ -61,8 +74,18 @@ def _ensure_session_defaults() -> None:
         "characteristics": ["Maj7", "9th"],
         "chords_per_progression": 4,
         "progression_count": 4,
+        "start_degree": None,
+        "end_degree": None,
+        "tension_preference": "Balanced",
+        "resolution_preference": "Flexible",
+        "voice_leading_preference": "Balanced",
+        "required_degrees": [],
+        "excluded_degrees": [],
+        "max_difficulty": "Any",
+        "chord_families": [],
         "last_result": None,
-        "generation_seed": random.randrange(1_000_000_000),
+        "generation_seed": random_seed(),
+        "use_fixed_seed": False,
         "saved_progressions": [],
         "pending_action": None,
     }
@@ -73,6 +96,63 @@ def _ensure_session_defaults() -> None:
 
 def _set_action(action: str) -> None:
     st.session_state.pending_action = action
+
+
+def _set_new_seed() -> None:
+    st.session_state.generation_seed = random_seed()
+
+
+def _prepare_pending_seed() -> None:
+    """Prepare a pending action's seed before any seed widget is instantiated."""
+    action = st.session_state.pending_action
+    if action is None or action.startswith("refine:"):
+        return
+    st.session_state.generation_seed = seed_for_action(
+        st.session_state.generation_seed,
+        action,
+        st.session_state.use_fixed_seed,
+    )
+
+
+def _sync_session_to_parameters(parameters: GeneratorParameters) -> None:
+    """Synchronize refinement changes back into the sidebar controls."""
+    st.session_state.root = parameters.key.root
+    st.session_state.accidental = parameters.key.accidental
+    st.session_state.key_type = parameters.key.mode
+    st.session_state.minor_scale_type = parameters.key.minor_scale_type
+    st.session_state.moods = list(parameters.moods)
+    st.session_state.styles = list(parameters.styles)
+    st.session_state.complexity = parameters.complexity
+    st.session_state.characteristics = list(parameters.characteristics)
+    st.session_state.chords_per_progression = parameters.chords_per_progression
+    st.session_state.progression_count = parameters.progression_count
+    st.session_state.start_degree = parameters.start_degree
+    st.session_state.end_degree = parameters.end_degree
+    st.session_state.tension_preference = parameters.tension_preference
+    st.session_state.resolution_preference = parameters.resolution_preference
+    st.session_state.voice_leading_preference = parameters.voice_leading_preference
+    st.session_state.required_degrees = list(parameters.required_degrees)
+    st.session_state.excluded_degrees = list(parameters.excluded_degrees)
+    st.session_state.max_difficulty = parameters.max_difficulty
+    st.session_state.chord_families = list(parameters.chord_families)
+
+
+def _apply_refinement(action: str) -> None:
+    """Prepare a result refinement before Streamlit rebuilds the page."""
+    record = st.session_state.get("last_result")
+    if not record or record.get("parameters") is None:
+        return
+
+    parameters: GeneratorParameters = record["parameters"]
+    refinement_seed = seed_for_action(
+        st.session_state.generation_seed,
+        "refine",
+        st.session_state.use_fixed_seed,
+    )
+    refined = refine_parameters(parameters, action, seed=refinement_seed)
+    st.session_state.generation_seed = refinement_seed
+    _sync_session_to_parameters(refined)
+    st.session_state.pending_action = f"refine:{action}"
 
 
 def _apply_randomization() -> None:
@@ -87,7 +167,24 @@ def _apply_randomization() -> None:
     st.session_state.characteristics = list(randomized.characteristics)
     st.session_state.chords_per_progression = randomized.chords_per_progression
     st.session_state.progression_count = randomized.progression_count
+    st.session_state.start_degree = randomized.start_degree
+    st.session_state.end_degree = randomized.end_degree
+    st.session_state.tension_preference = randomized.tension_preference
+    st.session_state.resolution_preference = randomized.resolution_preference
+    st.session_state.voice_leading_preference = randomized.voice_leading_preference
+    st.session_state.required_degrees = list(randomized.required_degrees)
+    st.session_state.excluded_degrees = list(randomized.excluded_degrees)
+    st.session_state.max_difficulty = randomized.max_difficulty
+    st.session_state.chord_families = list(randomized.chord_families)
     st.session_state.pending_action = "randomize"
+
+
+def _degree_option_label(key, degree: int | None) -> str:
+    if degree is None:
+        return "Any"
+    chord = get_chords_in_key(key)[degree - 1]
+    function = chord_function(chord, key, degree)
+    return f"{chord.roman_numeral} — {function}"
 
 
 def _copy_button(text: str, key: str) -> None:
@@ -165,7 +262,14 @@ def _render_progression(label: str, progression: Progression) -> None:
 
         st.markdown(f"### {progression.display_name}")
         st.write(f"Roman numerals: {' → '.join(progression.roman_numerals)}")
+        if progression.functions:
+            st.write(f"Harmonic function: {' → '.join(progression.functions)}")
         st.write(f"Difficulty: {progression.difficulty.display}")
+        degree_text = " → ".join(map(str, progression.degrees))
+        st.caption(f"Score: {progression.score:.2f} · Degrees: {degree_text}")
+        with st.expander("Why these chords work"):
+            for explanation in explain_functions(progression):
+                st.write(f"• {explanation}")
 
         st.markdown("**Recommended playing**")
         st.write(progression.playing.technique)
@@ -181,10 +285,10 @@ def _render_progression(label: str, progression: Progression) -> None:
                     st.code(voicing.tab, language="text")
                     st.caption(f"{voicing.difficulty} · bass: {voicing.bass_note or '—'}")
 
-        st.caption(f"Generator score: {progression.score:.2f}")
 
 
 _ensure_session_defaults()
+_prepare_pending_seed()
 
 st.title("🎸 Guitar Chord Generator")
 st.caption("Turn a mood and musical character into playable guitar chord progressions.")
@@ -198,6 +302,34 @@ with st.sidebar:
         type="secondary",
     )
     st.caption("Randomize changes the parameters and generates a new result.")
+
+    with st.expander("Seed / Reproducibility", expanded=False):
+        st.checkbox(
+            "Use fixed seed",
+            key="use_fixed_seed",
+            help=(
+                "Keep the same seed for Generate so the same parameters reproduce "
+                "the same progressions. Regenerate/refinement advances the seed by one."
+            ),
+        )
+        if st.session_state.use_fixed_seed:
+            st.number_input(
+                "Seed",
+                min_value=MIN_SEED,
+                max_value=MAX_SEED,
+                step=1,
+                format="%d",
+                key="generation_seed",
+                help=f"Use any integer from {MIN_SEED} to {MAX_SEED}.",
+            )
+            st.button(
+                "🎲 New seed",
+                use_container_width=True,
+                on_click=_set_new_seed,
+            )
+            st.caption("Generate again with the same settings and seed to reproduce a result.")
+        else:
+            st.caption("A fresh random seed is used for each generation action.")
 
     root = st.selectbox("Root", ROOT_NOTES, key="root")
     accidental = st.selectbox("Accidental", ACCIDENTALS, key="accidental")
@@ -234,6 +366,70 @@ with st.sidebar:
         help="How many different progressions to generate.",
     )
 
+    harmony_key = GeneratorParameters.build_key(root, accidental, key_type, minor_scale_type)
+    with st.expander("Harmony Controls", expanded=False):
+        start_degree = st.selectbox(
+            "Starting Chord",
+            degree_choices(),
+            key="start_degree",
+            format_func=lambda degree: _degree_option_label(harmony_key, degree),
+            help="Any, or require the progression to begin on a specific scale degree.",
+        )
+        end_degree = st.selectbox(
+            "Ending Chord",
+            degree_choices(),
+            key="end_degree",
+            format_func=lambda degree: _degree_option_label(harmony_key, degree),
+            help="Any, or require the progression to finish on a specific scale degree.",
+        )
+        tension_preference = st.selectbox(
+            "Tension",
+            TENSION_LEVELS,
+            key="tension_preference",
+            help="Guide the overall harmonic tension without overriding key or style.",
+        )
+        resolution_preference = st.selectbox(
+            "Resolution",
+            RESOLUTION_PREFERENCES,
+            key="resolution_preference",
+            help="Control how strongly the generator favors a resolving ending.",
+        )
+        voice_leading_preference = st.selectbox(
+            "Voice Leading",
+            VOICE_LEADING_PREFERENCES,
+            key="voice_leading_preference",
+            help="Prefer smoother note movement, a balance, or more contrast between chords.",
+        )
+
+    with st.expander("Filters", expanded=False):
+        filter_degree_options = list(range(1, 8))
+        required_degrees = st.multiselect(
+            "Require scale degrees",
+            filter_degree_options,
+            key="required_degrees",
+            format_func=lambda degree: _degree_option_label(harmony_key, degree),
+            help="Every generated progression must contain each selected scale degree at least once.",
+        )
+        excluded_degrees = st.multiselect(
+            "Exclude scale degrees",
+            filter_degree_options,
+            key="excluded_degrees",
+            format_func=lambda degree: _degree_option_label(harmony_key, degree),
+            help="Selected scale degrees cannot appear in generated progressions.",
+        )
+        max_difficulty = st.selectbox(
+            "Maximum result difficulty",
+            DIFFICULTY_FILTERS,
+            key="max_difficulty",
+            help="Reject results whose measured harmonic difficulty is above this level.",
+        )
+        chord_families = st.multiselect(
+            "Allowed chord families",
+            CHORD_FAMILIES,
+            key="chord_families",
+            help="Every chord in a result must belong to one of the selected families. Leave empty for any family.",
+        )
+
     st.divider()
     generate_col, regenerate_col = st.columns(2)
     with generate_col:
@@ -261,22 +457,40 @@ parameters = GeneratorParameters(
     characteristics=tuple(characteristics),
     chords_per_progression=chords_per_progression,
     progression_count=progression_count,
+    start_degree=start_degree,
+    end_degree=end_degree,
+    tension_preference=tension_preference,
+    resolution_preference=resolution_preference,
+    voice_leading_preference=voice_leading_preference,
+    required_degrees=tuple(required_degrees),
+    excluded_degrees=tuple(excluded_degrees),
+    max_difficulty=max_difficulty,
+    chord_families=tuple(chord_families),
 )
 
 pending_action = st.session_state.pending_action
 if pending_action is not None:
     st.session_state.pending_action = None
 
-    # Randomize, Generate, and Regenerate all end in a new generated result.
-    # They differ only in whether parameters change and whether the seed changes.
-    st.session_state.generation_seed = random.randrange(1_000_000_000)
+    # Fixed-seed Generate reproduces the same result; Regenerate and refinements
+    # advance the seed so those actions still produce a fresh deterministic result.
+    used_seed = st.session_state.generation_seed
+    try:
+        generated_result = generate_progressions(
+            parameters,
+            seed=used_seed,
+        )
+        generation_error = None
+    except (RuntimeError, ValueError) as exc:
+        generated_result = None
+        generation_error = str(exc)
     st.session_state.last_result = {
         "action": pending_action,
         "parameters": parameters,
-        "result": generate_progressions(
-            parameters,
-            seed=st.session_state.generation_seed,
-        ),
+        "result": generated_result,
+        "error": generation_error,
+        "seed": used_seed,
+        "seed_mode": "fixed" if st.session_state.use_fixed_seed else "automatic",
     }
 
 left, right = st.columns([2.6, 1])
@@ -288,21 +502,50 @@ with left:
         st.info("Choose your parameters and press Generate.")
     else:
         record = st.session_state.last_result
-        result: GeneratedProgressions = record["result"]
         active_parameters: GeneratorParameters = record["parameters"]
+        result: GeneratedProgressions | None = record["result"]
 
-        st.caption(
-            f"{active_parameters.key.name} · "
-            f"Mood: {', '.join(active_parameters.moods) or 'None'} · "
-            f"Character: {', '.join(active_parameters.styles) or 'None'} · "
-            f"Complexity: {active_parameters.complexity} · "
-            f"{active_parameters.chords_per_progression} chords × "
-            f"{active_parameters.progression_count} progressions"
-        )
+        if result is None:
+            st.error(record.get("error", "No progression could be generated with the selected settings."))
+        else:
+            filter_labels = active_filter_labels(active_parameters)
+            seed_used = record.get("seed", st.session_state.generation_seed)
+            seed_mode = record.get(
+                "seed_mode",
+                "fixed" if st.session_state.use_fixed_seed else "automatic",
+            )
+            st.caption(
+                f"{active_parameters.key.name} · "
+                f"Seed: {seed_used} ({seed_mode}) · "
+                f"Mood: {', '.join(active_parameters.moods) or 'None'} · "
+                f"Character: {', '.join(active_parameters.styles) or 'None'} · "
+                f"Complexity: {active_parameters.complexity} · "
+                f"{active_parameters.chords_per_progression} chords × "
+                f"{active_parameters.progression_count} progressions · "
+                f"Tension: {active_parameters.tension_preference} · "
+                f"Resolution: {active_parameters.resolution_preference}"
+            )
+            if filter_labels:
+                st.caption(" · ".join(filter_labels))
 
-        labels = ["MAIN"] + [f"ALTERNATIVE {i}" for i in range(1, len(result.all_progressions))]
-        for label, progression in zip(labels, result.all_progressions):
-            _render_progression(label, progression)
+            st.markdown("**Refine this result**")
+            refinement_columns = st.columns(4)
+            refinement_actions = ("simpler", "complex", "new_progression", "new_mood")
+            for column, action in zip(refinement_columns, refinement_actions):
+                with column:
+                    st.button(
+                        refinement_label(action),
+                        key=f"refine-{action}",
+                        use_container_width=True,
+                        disabled=not refinement_is_available(active_parameters, action),
+                        help=refinement_help(action),
+                        on_click=_apply_refinement,
+                        args=(action,),
+                    )
+
+            labels = ["MAIN"] + [f"ALTERNATIVE {i}" for i in range(1, len(result.all_progressions))]
+            for label, progression in zip(labels, result.all_progressions):
+                _render_progression(label, progression)
 
 with right:
     st.subheader("All Chords in Key")

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from dataclasses import dataclass, replace
 import math
 import random
@@ -19,7 +18,23 @@ from music.options import (
 )
 
 from .difficulty import DifficultyRating, calculate_difficulty
+from .filters import (
+    CHORD_FAMILIES,
+    DIFFICULTY_FILTERS,
+    chord_family,
+    progression_matches_filters,
+)
 from .harmony_profiles import HarmonyProfile, combine_profiles, score_chord
+from .harmony_rules import (
+    chord_function,
+    chord_tension,
+    functional_sequence_score,
+    resolution_score,
+    target_tension_score,
+    transition_function_score,
+    validate_progression_preferences,
+    voice_leading_score,
+)
 from .playing import PlayingRecommendation, recommend_playing_style
 
 # Curated progression shapes. The keys are progression lengths so the user can
@@ -82,38 +97,6 @@ MINOR_TEMPLATES: dict[int, tuple[tuple[int, ...], ...]] = {
     ),
 }
 
-STYLE_TEMPLATE_WEIGHTS: dict[str, dict[str, float]] = {
-    "Neo Soul": {"jazz": 1.6, "pop": 0.4},
-    "Jazz": {"jazz": 2.0, "classic": 0.7},
-    "R&B": {"jazz": 1.5, "pop": 0.7},
-    "Funk": {"funk": 1.8, "classic": 0.4},
-    "Pop": {"pop": 1.8, "classic": 0.7},
-    "Blues": {"funk": 1.7, "classic": 0.8},
-    "Lo-fi": {"jazz": 1.2, "pop": 0.6},
-    "Gospel": {"jazz": 1.6, "classic": 0.8},
-    "Acoustic": {"pop": 1.6, "classic": 0.7},
-    "Rock": {"classic": 1.6, "funk": 0.9},
-    "Cinematic": {"cinematic": 1.8, "classic": 0.7},
-}
-
-MOOD_TEMPLATE_WEIGHTS: dict[str, dict[str, float]] = {
-    "Happy": {"pop": 1.0, "classic": 0.7},
-    "Sad": {"minor": 1.2, "cinematic": 0.8},
-    "Dreamy": {"jazz": 1.0, "cinematic": 0.9},
-    "Dark": {"minor": 1.5, "cinematic": 1.0},
-    "Romantic": {"jazz": 1.1, "pop": 0.7},
-    "Mysterious": {"cinematic": 1.4, "minor": 1.0},
-    "Tense": {"jazz": 0.9, "cinematic": 1.2},
-    "Peaceful": {"pop": 0.9, "classic": 0.8},
-    "Nostalgic": {"classic": 1.2, "pop": 0.7},
-    "Funky": {"funk": 1.5},
-    "Soulful": {"jazz": 1.3, "classic": 0.5},
-    "Cinematic": {"cinematic": 1.7},
-    "Hopeful": {"pop": 1.2, "classic": 0.7},
-    "Aggressive": {"funk": 1.1, "minor": 0.8},
-    "Melancholic": {"minor": 1.4, "jazz": 0.8},
-}
-
 
 def _validate_parameters(parameters: GeneratorParameters) -> None:
     if parameters.complexity not in COMPLEXITIES:
@@ -123,7 +106,9 @@ def _validate_parameters(parameters: GeneratorParameters) -> None:
         raise ValueError(f"Unsupported mood(s): {', '.join(invalid_moods)}")
     invalid_styles = [s for s in parameters.styles if s not in MUSICAL_CHARACTERS]
     if invalid_styles:
-        raise ValueError(f"Unsupported musical character(s): {', '.join(invalid_styles)}")
+        raise ValueError(
+            f"Unsupported musical character(s): {', '.join(invalid_styles)}"
+        )
     invalid_characteristics = [
         c for c in parameters.characteristics if c not in CHORD_CHARACTERISTICS
     ]
@@ -135,6 +120,43 @@ def _validate_parameters(parameters: GeneratorParameters) -> None:
         raise ValueError("chords_per_progression must be between 2 and 8")
     if not 1 <= parameters.progression_count <= 8:
         raise ValueError("progression_count must be between 1 and 8")
+
+    for field_name, values in (
+        ("required_degrees", parameters.required_degrees),
+        ("excluded_degrees", parameters.excluded_degrees),
+    ):
+        invalid = [degree for degree in values if degree not in range(1, 8)]
+        if invalid:
+            raise ValueError(
+                f"Unsupported {field_name}: {', '.join(map(str, invalid))}. "
+                "Scale degrees must be between 1 and 7"
+            )
+    if set(parameters.required_degrees).intersection(parameters.excluded_degrees):
+        raise ValueError("A scale degree cannot be both required and excluded")
+    if parameters.start_degree in parameters.excluded_degrees:
+        raise ValueError("Starting Chord cannot be an excluded degree")
+    if parameters.end_degree in parameters.excluded_degrees:
+        raise ValueError("Ending Chord cannot be an excluded degree")
+    if parameters.max_difficulty not in DIFFICULTY_FILTERS:
+        raise ValueError(
+            f"Unsupported max_difficulty: {parameters.max_difficulty}. "
+            f"Use one of {', '.join(DIFFICULTY_FILTERS)}"
+        )
+    invalid_families = [
+        family for family in parameters.chord_families if family not in CHORD_FAMILIES
+    ]
+    if invalid_families:
+        raise ValueError(
+            f"Unsupported chord family filter(s): {', '.join(invalid_families)}"
+        )
+
+    validate_progression_preferences(
+        start_degree=parameters.start_degree,
+        end_degree=parameters.end_degree,
+        tension_preference=parameters.tension_preference,
+        resolution_preference=parameters.resolution_preference,
+        voice_leading_preference=parameters.voice_leading_preference,
+    )
 
 
 def _template_family(template: tuple[int, ...], mode: str) -> str:
@@ -158,26 +180,114 @@ def _templates_for_key(key: Key, length: int) -> tuple[tuple[int, ...], ...]:
     return bank[length]
 
 
+def _constrain_template(
+    template: tuple[int, ...],
+    start_degree: int | None,
+    end_degree: int | None,
+) -> tuple[int, ...]:
+    """Apply hard start/end degree constraints to a curated template."""
+    values = list(template)
+    if start_degree is not None:
+        values[0] = start_degree
+    if end_degree is not None:
+        values[-1] = end_degree
+    return tuple(values)
+
+
+def _templates_for_parameters(
+    key: Key,
+    parameters: GeneratorParameters,
+) -> tuple[tuple[int, ...], ...]:
+    """Return curated templates with hard endpoint constraints applied.
+
+    When a requested start/end pair is not present in the curated bank, the
+    same bank remains the source of the internal middle movement; only the
+    endpoints are replaced. This keeps constrained generation deterministic and
+    prevents the UI from failing because a valid pair was not pre-authored.
+    """
+    base_templates = _templates_for_key(key, parameters.chords_per_progression)
+    constrained = tuple(
+        dict.fromkeys(
+            _constrain_template(
+                template,
+                parameters.start_degree,
+                parameters.end_degree,
+            )
+            for template in base_templates
+        )
+    )
+    if parameters.required_degrees:
+        required = set(parameters.required_degrees)
+        constrained = tuple(
+            template
+            for template in constrained
+            if required.issubset(set(template))
+        )
+    if parameters.excluded_degrees:
+        excluded = set(parameters.excluded_degrees)
+        constrained = tuple(
+            template
+            for template in constrained
+            if not excluded.intersection(template)
+        )
+    if not constrained:
+        raise RuntimeError(
+            "No progression templates satisfy the selected degree filters. "
+            "Try relaxing Required/Excluded degrees."
+        )
+    return constrained
+
+
 def _template_preference(
     template: tuple[int, ...],
     key: Key,
-    moods: tuple[str, ...],
-    styles: tuple[str, ...],
+    profile: HarmonyProfile,
+    parameters: GeneratorParameters,
 ) -> float:
     family = _template_family(template, key.mode)
-    score = 0.0
+    score = profile.template_weight(family)
     if key.mode == "Minor" and family == "minor":
         score += 1.0
-    for style in styles:
-        score += STYLE_TEMPLATE_WEIGHTS.get(style, {}).get(family, 0.0)
-    for mood in moods:
-        score += MOOD_TEMPLATE_WEIGHTS.get(mood, {}).get(family, 0.0)
     if template[-1] == 1:
         score += 0.8
     if 5 in template:
         score += 0.35
     if len(set(template)) >= max(2, len(template) // 2):
         score += 0.2
+
+    # Degree-level tension gives the template selector an early signal before
+    # actual chord qualities are sampled.
+    degree_tensions = [
+        0.15 if degree in {1, 6} else
+        0.45 if degree in {2, 4} else
+        0.85 if degree in {5, 7} else 0.55
+        for degree in template
+    ]
+    target = {"Low": 0.25, "Balanced": 0.50, "High": 0.75}[parameters.tension_preference]
+    average_tension = sum(degree_tensions) / len(degree_tensions)
+    score += (1.0 - abs(average_tension - target)) * 0.8
+
+    functions = [
+        "Tonic" if degree in {1, 6}
+        else "Predominant" if degree in {2, 4}
+        else "Dominant" if degree in {5, 7}
+        else "Color"
+        for degree in template
+    ]
+    for previous_function, current_function in zip(functions, functions[1:]):
+        if (previous_function, current_function) == ("Predominant", "Dominant"):
+            score += 0.45
+        elif (previous_function, current_function) == ("Dominant", "Tonic"):
+            score += 0.65
+
+    if parameters.resolution_preference == "Prefer Tonic" and functions[-1] == "Tonic":
+        score += 0.9
+    if parameters.resolution_preference == "Strong Cadence":
+        if functions[-1] == "Tonic":
+            score += 1.0
+        if len(functions) >= 2 and functions[-2:] == ["Dominant", "Tonic"]:
+            score += 1.1
+
     return score
 
 
@@ -190,9 +300,18 @@ def _candidate_pool(
     degree: int,
     characteristics: tuple[str, ...],
     complexity: str,
+    chord_families: tuple[str, ...] = (),
 ) -> list[Chord]:
     candidates = get_chord_candidates(key, degree, characteristics, complexity)
-    return candidates if candidates else [_fallback_candidate(key, degree)]
+    if not candidates:
+        candidates = [_fallback_candidate(key, degree)]
+    if chord_families:
+        candidates = [
+            chord
+            for chord in candidates
+            if chord_family(chord) in chord_families
+        ]
+    return candidates
 
 
 def _progression_signature(chords: tuple[Chord, ...]) -> tuple[str, ...]:
@@ -204,6 +323,7 @@ def _degree_signature(chords: tuple[Chord, ...]) -> tuple[str | None, ...]:
 
 
 def _transition_score(previous: Chord, current: Chord, key: Key) -> float:
+    """Retain the V1 local cadence rules while delegating broader function logic."""
     prev = previous.roman_numeral
     curr = current.roman_numeral
     if not prev or not curr:
@@ -211,15 +331,15 @@ def _transition_score(previous: Chord, current: Chord, key: Key) -> float:
     prev_base = prev.replace("°", "").replace("+", "")
     curr_base = curr.replace("°", "").replace("+", "")
     score = 0.0
-    if prev_base in {"V", "v"} and curr_base in {"I", "i"}:
+    if prev_base.lower() == "v" and curr_base.lower() == "i":
         score += 3.0
-    if prev_base in {"ii", "ii°", "iv"} and curr_base in {"V", "v"}:
+    if prev_base.lower() in {"ii", "iv"} and curr_base.lower() == "v":
         score += 1.5
-    if prev_base == "VII" and curr_base in {"I", "i"}:
+    if prev_base.lower() == "vii" and curr_base.lower() == "i":
         score += 1.1
-    if prev_base == "IV" and curr_base in {"V", "v"}:
+    if prev_base.lower() == "iv" and curr_base.lower() == "v":
         score += 0.9
-    if curr_base in {"I", "i"} and prev_base != curr_base:
+    if curr_base.lower() == "i" and prev_base.lower() != curr_base.lower():
         score += 0.25
     if previous.root == current.root:
         score -= 0.7
@@ -231,13 +351,25 @@ def _progression_score(
     profile: HarmonyProfile,
     template: tuple[int, ...],
     key: Key,
-    moods: tuple[str, ...],
-    styles: tuple[str, ...],
+    parameters: GeneratorParameters,
 ) -> float:
     score = sum(score_chord(chord, profile) for chord in chords)
     for previous, current in zip(chords, chords[1:]):
         score += _transition_score(previous, current, key)
-    score += _template_preference(template, key, moods, styles)
+    score += _template_preference(template, key, profile, parameters)
+
+    # Step 2 harmonic-function awareness. These terms intentionally remain
+    # smaller than the chord-profile score so style/mood remains primary.
+    score += 0.45 * functional_sequence_score(chords, key)
+    score += 0.35 * sum(
+        transition_function_score(previous, current, key)
+        for previous, current in zip(chords, chords[1:])
+    )
+    score += target_tension_score(chords, key, parameters.tension_preference)
+    score += resolution_score(chords, key, parameters.resolution_preference)
+    score += voice_leading_score(chords, parameters.voice_leading_preference)
+
+    # Keep a light penalty for repetitive harmonic texture.
     qualities = {chord.quality for chord in chords}
     if len(qualities) == 1:
         score -= 1.0
@@ -245,6 +377,7 @@ def _progression_score(
         score += 0.4
     if len(set(chord.root for chord in chords)) == 1:
         score -= 1.0
+
     return round(score, 6)
 
 
@@ -288,6 +421,8 @@ class Progression:
     difficulty: DifficultyRating
     playing: PlayingRecommendation
     voicings: tuple[GuitarVoicing, ...] = ()
+    functions: tuple[str, ...] = ()
+    tensions: tuple[float, ...] = ()
 
     @property
     def display_name(self) -> str:
@@ -313,15 +448,22 @@ def _build_template_candidates(
     trials: int,
 ) -> list[Progression]:
     pools = [
-        _candidate_pool(key, degree, parameters.characteristics, parameters.complexity)
+        _candidate_pool(
+            key,
+            degree,
+            parameters.characteristics,
+            parameters.complexity,
+            parameters.chord_families,
+        )
         for degree in template
     ]
+    if any(not pool for pool in pools):
+        return []
+
     results: list[Progression] = []
     for _ in range(trials):
         chords = tuple(_sample_candidate(pool, profile, rng) for pool in pools)
-        score = _progression_score(
-            chords, profile, template, key, parameters.moods, parameters.styles
-        )
+        score = _progression_score(chords, profile, template, key, parameters)
         playing_seed = rng.randrange(1_000_000_000)
         results.append(
             Progression(
@@ -331,6 +473,14 @@ def _build_template_candidates(
                 degrees=template,
                 difficulty=calculate_difficulty(chords, key),
                 playing=recommend_playing_style(parameters, chords, seed=playing_seed),
+                functions=tuple(
+                    chord_function(chord, key, degree)
+                    for chord, degree in zip(chords, template)
+                ),
+                tensions=tuple(
+                    chord_tension(chord, key, degree)
+                    for chord, degree in zip(chords, template)
+                ),
             )
         )
     return results
@@ -401,14 +551,22 @@ def generate_progressions(
     rng = random.Random(seed)
     length = parameters.chords_per_progression
     count = parameters.progression_count
-    templates = _templates_for_key(parameters.key, length)
+    templates = _templates_for_parameters(parameters.key, parameters)
 
     template_trials = max(12, count * 10)
     all_candidates: list[Progression] = []
 
-    # Sample every curated template, but vary candidate selection inside each
-    # template. This gives style/mood influence without collapsing to one answer.
-    for template in templates:
+    # Sample every constrained curated template, but vary candidate selection
+    # inside each template. This gives style/mood influence without collapsing
+    # to one answer while Step 2 controls steer harmonic movement.
+    ranked_templates = sorted(
+        templates,
+        key=lambda template: _template_preference(
+            template, parameters.key, profile, parameters
+        ),
+        reverse=True,
+    )
+    for template in ranked_templates:
         all_candidates.extend(
             _build_template_candidates(
                 parameters.key,
@@ -423,7 +581,18 @@ def generate_progressions(
     if not all_candidates:
         raise RuntimeError("No valid progression candidates could be generated")
 
-    selected = _select_distinct(all_candidates, count, rng, length)
+    filtered_candidates = [
+        candidate
+        for candidate in all_candidates
+        if progression_matches_filters(candidate, parameters)
+    ]
+    if not filtered_candidates:
+        raise RuntimeError(
+            "No generated progressions match the active filters. "
+            "Try relaxing the filters or increasing the allowed complexity."
+        )
+
+    selected = _select_distinct(filtered_candidates, count, rng, length)
     selected_with_voicings = [
         replace(item, voicings=find_progression_voicings(item.chords))
         for item in selected

@@ -7,6 +7,7 @@ from generator.harmony_profiles import (
     get_mood_profile,
     get_style_profile,
     score_chord,
+    TEMPLATE_FAMILIES,
 )
 from music.chord_qualities import CHORD_QUALITIES, DERIVED_CHORD_QUALITIES, build_chord, build_derived_chord
 from music.options import MOODS, MUSICAL_CHARACTERS
@@ -167,3 +168,31 @@ def test_every_mood_style_pair_can_be_combined_and_score_common_chords():
             scores = [score_chord(chord, profile) for chord in chords]
             assert len(scores) == len(chords)
             assert all(isinstance(value, float) for value in scores)
+
+
+def test_every_mood_and_style_profile_has_valid_template_preferences():
+    for profile in [*MOOD_PROFILES.values(), *STYLE_PROFILES.values()]:
+        families = tuple(family for family, _ in profile.template_preferences)
+        weights = tuple(weight for _, weight in profile.template_preferences)
+        assert families == tuple(sorted(set(families)))
+        assert set(families) <= TEMPLATE_FAMILIES
+        assert all(isinstance(weight, float) for weight in weights)
+        assert all(weight > 0 for weight in weights)
+
+
+def test_combined_profile_merges_template_preferences_from_mood_and_style():
+    dreamy = get_mood_profile("Dreamy")
+    neo_soul = get_style_profile("Neo Soul")
+    combined = combine_profiles(["Dreamy"], ["Neo Soul"])
+
+    for family in TEMPLATE_FAMILIES:
+        expected = dreamy.template_weight(family) + neo_soul.template_weight(family)
+        assert combined.template_weight(family) == pytest.approx(expected)
+
+
+def test_template_preferences_change_with_mood_and_style():
+    dreamy_jazz = combine_profiles(["Dreamy"], ["Neo Soul"])
+    dark_cinematic = combine_profiles(["Dark"], ["Cinematic"])
+
+    assert dreamy_jazz.template_weight("jazz") > dark_cinematic.template_weight("jazz")
+    assert dark_cinematic.template_weight("cinematic") > dreamy_jazz.template_weight("cinematic")
